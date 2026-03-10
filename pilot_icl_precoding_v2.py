@@ -27,6 +27,9 @@ from tqdm import tqdm
 import warnings
 import os
 import time
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,6 +68,7 @@ class Config:
         # Training
         self.batch_size = kwargs.get('batch_size', 64)
         self.lr = kwargs.get('lr', 3e-4)
+        self.lr_min = kwargs.get('lr_min', 5e-5)
         self.weight_decay = kwargs.get('weight_decay', 1e-4)
 
         # Dataset
@@ -83,6 +87,10 @@ class Config:
         self.tau_start = kwargs.get('tau_start', 30)
         self.tau_end = kwargs.get('tau_end', 65)
         self.max_dataset_size = kwargs.get('max_dataset_size', 30000)
+
+        # Loss balancing: scale unsup rate loss to match supervised MSE magnitude
+        # Diagnostic showed |rate|/|MSE| ~ 100x at Phase 1/2 boundary → scale = 0.005
+        self.unsup_scale = kwargs.get('unsup_scale', 0.005)
 
         # Eval
         self.n_test = kwargs.get('n_test', 300)
@@ -118,6 +126,12 @@ def pilot_observe(H: torch.Tensor, Phi: torch.Tensor, sigma2: float) -> torch.Te
 def pilot_to_real(Y: torch.Tensor) -> torch.Tensor:
     """(B, N, L_p) complex -> (B, 2*N*L_p) real."""
     return torch.cat([Y.real, Y.imag], dim=1).reshape(Y.size(0), -1)
+
+
+def hhat_to_real(H_hat: torch.Tensor) -> torch.Tensor:
+    """(B, K, N) complex -> (B, 2*K*N) real."""
+    B, K, N = H_hat.shape
+    return torch.cat([H_hat.real, H_hat.imag], dim=-1).reshape(B, 2 * K * N)
 
 
 def mmse_channel_est(Y: torch.Tensor, Phi: torch.Tensor, sigma2: float) -> torch.Tensor:
@@ -278,32 +292,41 @@ def compute_baselines(H_test: torch.Tensor, Phi: torch.Tensor,
 
 
 ###############################################################################
-# 5. PILOT ENCODER: 1D-CNN + Attention Pooling
+# 5. PILOT ENCODER: 1D-CNN + Attention Pooling  +  MMSE-estimate branch
 ###############################################################################
 class PilotEncoder(nn.Module):
     def __init__(self, N: int, L_p: int, K: int, hidden: int = 128):
         super().__init__()
-        self.N, self.L_p = N, L_p
+        self.N, self.L_p, self.K = N, L_p, K
+        # Branch 1: raw pilot observations Y (CNN + attention over L_p slots)
         self.conv1 = nn.Conv1d(2 * N, hidden, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(hidden, hidden, kernel_size=3, padding=1)
         self.ln = nn.LayerNorm(hidden)
         self.attn_q = nn.Parameter(torch.randn(1, 1, hidden) * 0.02)
         self.attn_k = nn.Linear(hidden, hidden)
         self.attn_v = nn.Linear(hidden, hidden)
+        # Branch 2: MMSE channel estimate H_hat (MLP over vec(H_hat))
+        self.h_branch = nn.Sequential(
+            nn.Linear(2 * K * N, hidden), nn.GELU(), nn.Linear(hidden, hidden))
+        # Combined output: cat([z_y, z_h]) -> 4*K token
         self.out_proj = nn.Sequential(
-            nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 4 * K))
+            nn.Linear(2 * hidden, hidden), nn.GELU(), nn.Linear(hidden, 4 * K))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: (B, 2*N*L_p) -> (B, 4K)"""
+    def forward(self, x: torch.Tensor, h_hat: torch.Tensor) -> torch.Tensor:
+        """x: (B, 2*N*L_p), h_hat: (B, 2*K*N) -> (B, 4K)"""
         B = x.size(0)
+        # Branch 1: CNN over pilot slots
         x = x.view(B, 2 * self.N, self.L_p)
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
-        x = self.ln(x.transpose(1, 2))        # (B, L_p, H)
+        x = self.ln(x.transpose(1, 2))              # (B, L_p, H)
         q = self.attn_q.expand(B, -1, -1)
         k, v = self.attn_k(x), self.attn_v(x)
         w = F.softmax(torch.bmm(q, k.transpose(1, 2)) / math.sqrt(k.size(-1)), dim=-1)
-        return self.out_proj(torch.bmm(w, v).squeeze(1))
+        z_y = torch.bmm(w, v).squeeze(1)            # (B, hidden)
+        # Branch 2: MMSE estimate hint
+        z_h = self.h_branch(h_hat)                  # (B, hidden)
+        return self.out_proj(torch.cat([z_y, z_h], dim=-1))
 
 
 ###############################################################################
@@ -379,16 +402,19 @@ class PilotICLModel(nn.Module):
         lam = F.softplus(raw[:, self.K:2 * self.K])
         return p, lam
 
-    def forward(self, demo_pilots, demo_p, demo_lam, query_pilot):
+    def forward(self, demo_pilots, demo_h_hats, demo_p, demo_lam, query_pilot, query_h_hat):
         """
-        demo_pilots: (B, l, pilot_dim)
-        demo_p/lam: (B, l, K)
-        query_pilot: (B, pilot_dim)
+        demo_pilots:  (B, l, 2*N*L_p)   raw pilot obs (real)
+        demo_h_hats:  (B, l, 2*K*N)     MMSE estimate of demo channels (real)
+        demo_p/lam:   (B, l, K)
+        query_pilot:  (B, 2*N*L_p)
+        query_h_hat:  (B, 2*K*N)
         Returns: (p_pred, lam_pred) each (B, K)
         """
         B, l, pd = demo_pilots.shape
-        all_pil = torch.cat([demo_pilots.reshape(B*l, pd), query_pilot], dim=0)
-        all_z = self.encoder(all_pil)
+        all_pil  = torch.cat([demo_pilots.reshape(B*l, pd), query_pilot], dim=0)
+        all_hhat = torch.cat([demo_h_hats.reshape(B*l, -1), query_h_hat], dim=0)
+        all_z = self.encoder(all_pil, all_hhat)
         demo_z = all_z[:B*l].reshape(B, l, self.token_dim)
         query_z = all_z[B*l:]
 
@@ -457,16 +483,19 @@ def evaluate_model(model: PilotICLModel, dataset: DynDataset,
 
         Y = pilot_observe(H, Phi, cfg.sigma2)
         pil = pilot_to_real(Y)
+        H_hat = mmse_channel_est(Y, Phi, cfg.sigma2)
+        q_h_hat = hhat_to_real(H_hat)
 
         # Context from dataset (random)
         idx = torch.randint(0, dataset.size, (b, cfg.n_demos), device=device)
         d_H = dataset.H[idx].reshape(b * cfg.n_demos, cfg.K, cfg.N)
         d_Y = pilot_observe(d_H, Phi, cfg.sigma2)
         d_pil = pilot_to_real(d_Y).reshape(b, cfg.n_demos, -1)
+        d_H_hat = mmse_channel_est(d_Y, Phi, cfg.sigma2)
+        d_h_hat = hhat_to_real(d_H_hat).reshape(b, cfg.n_demos, -1)
         d_p, d_lam = dataset.p[idx], dataset.lam[idx]
 
-        p_pred, lam_pred = model(d_pil, d_p, d_lam, pil)
-        H_hat = mmse_channel_est(Y, Phi, cfg.sigma2)
+        p_pred, lam_pred = model(d_pil, d_h_hat, d_p, d_lam, pil, q_h_hat)
         W = reconstruct_precoder(H_hat, p_pred, lam_pred, cfg.sigma2)
         all_rates.append(compute_sum_rate(H, W, cfg.sigma2))
 
@@ -486,7 +515,8 @@ def train(cfg: Config):
     print(f"  Tokens: dim={cfg.token_dim}, demos={cfg.n_demos}, seq_len={2*cfg.n_demos+1}")
     print(f"  Model:  d={cfg.d_model}, heads={cfg.n_heads}, layers={cfg.n_layers}, ff={cfg.d_ff}")
     print(f"  Train:  Phase1={cfg.phase1_epochs}ep, Phase2={cfg.phase2_epochs}ep, "
-          f"BS={cfg.batch_size}, steps/ep={cfg.steps_per_epoch}")
+          f"BS={cfg.batch_size}, steps/ep={cfg.steps_per_epoch}, "
+          f"lr={cfg.lr:.0e}->{cfg.lr_min:.0e} (cosine)")
     print()
 
     # ---- Fixed pilot matrix ----
@@ -534,7 +564,7 @@ def train(cfg: Config):
     model = PilotICLModel(cfg).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.total_epochs,
-                                                      eta_min=cfg.lr * 0.05)
+                                                      eta_min=cfg.lr_min)
 
     # ---- Training ----
     print("\n" + "=" * 75)
@@ -549,6 +579,8 @@ def train(cfg: Config):
     print("-" * 75)
 
     best_test_rate = 0.0
+    history: Dict[str, List] = {'test_rate': [], 'train_rate': [], 'mse': [],
+                                 'ds_size': [], 'ep_added': [], 'phase': []}
 
     for epoch in range(cfg.total_epochs):
         model.train()
@@ -590,25 +622,29 @@ def train(cfg: Config):
             q_H_unsup = generate_channel(B, cfg.K, cfg.N)
             q_H = torch.where(is_unsup.view(B, 1, 1).expand_as(q_H_sup), q_H_unsup, q_H_sup)
 
-            # Pilot signals
+            # Pilot signals + MMSE estimates (for encoder H_hat branch)
             d_H_flat = d_H.reshape(B * l, cfg.K, cfg.N)
             d_Y = pilot_observe(d_H_flat, Phi, cfg.sigma2)
             d_pil = pilot_to_real(d_Y).reshape(B, l, -1)
+            d_H_hat = mmse_channel_est(d_Y, Phi, cfg.sigma2)
+            d_h_hat = hhat_to_real(d_H_hat).reshape(B, l, -1)
             q_Y = pilot_observe(q_H, Phi, cfg.sigma2)
             q_pil = pilot_to_real(q_Y)
+            q_H_hat = mmse_channel_est(q_Y, Phi, cfg.sigma2)
+            q_h_hat = hhat_to_real(q_H_hat)
 
             # Forward
-            p_pred, lam_pred = model(d_pil, d_p, d_lam, q_pil)
+            p_pred, lam_pred = model(d_pil, d_h_hat, d_p, d_lam, q_pil, q_h_hat)
 
             # Losses
             mse_per = (F.mse_loss(p_pred, q_p_gt, reduction='none').sum(-1) +
                        F.mse_loss(lam_pred, q_lam_gt, reduction='none').sum(-1))
 
-            q_H_hat = mmse_channel_est(q_Y, Phi, cfg.sigma2)
             W_pred = reconstruct_precoder(q_H_hat, p_pred, lam_pred, cfg.sigma2)
             rate_pred = compute_sum_rate(q_H, W_pred, cfg.sigma2)
 
-            loss_per = torch.where(is_unsup, -rate_pred, mse_per)
+            # Scale unsup loss to match supervised MSE magnitude (prevents gradient dominance)
+            loss_per = torch.where(is_unsup, -rate_pred * cfg.unsup_scale, mse_per)
             loss = loss_per.mean()
 
             optimizer.zero_grad()
@@ -643,6 +679,22 @@ def train(cfg: Config):
         avg_rate = ep_rate / max(1, ep_steps)
         dt = time.time() - t0
 
+        history['test_rate'].append(test_rate)
+        history['train_rate'].append(avg_rate)
+        history['mse'].append(avg_mse)
+        history['ds_size'].append(dataset.size)
+        history['ep_added'].append(ep_added)
+        history['phase'].append(phase)
+
+        # Print loss scale diagnostic at Phase 1→2 boundary
+        if epoch == cfg.phase1_epochs:
+            ds_rate_avg = dataset.rates.mean().item() if dataset.rates is not None else 0.0
+            print(f"\n  [Loss balance] Phase 1 final MSE={avg_mse:.5f}, "
+                  f"dataset avg rate={ds_rate_avg:.2f} bps/Hz")
+            print(f"  [Loss balance] |rate|/|MSE| ~ {ds_rate_avg/max(avg_mse,1e-8):.0f}x  "
+                  f"-> unsup_scale={cfg.unsup_scale:.4f}  "
+                  f"(scaled rate loss ~ {ds_rate_avg*cfg.unsup_scale:.4f})\n", flush=True)
+
         print(f"{epoch+1:3d} {phase:>2d} {r:.2f} | "
               f"{avg_mse:8.5f} {avg_rate:8.4f} | "
               f"{test_rate:8.4f} | "
@@ -651,20 +703,96 @@ def train(cfg: Config):
               f"{baselines['opt_perfect']:6.2f} {baselines['opt_imperfect']:6.2f}  "
               f"({dt:.1f}s)", flush=True)
 
-    # ---- Final Summary ----
-    print("\n" + "=" * 75)
+    # ---- Final Results Table ----
+    b4 = baselines['opt_imperfect']
+    rows = [
+        ("MMSE BF + Perfect CSI",        baselines['mmse_perfect']),
+        ("MMSE BF + Imperfect CSI",       baselines['mmse_imperfect']),
+        ("Opt(p,lam) + Perfect CSI",      baselines['opt_perfect']),
+        ("Opt(p,lam) + Imperfect CSI",    b4),
+        ("ICL Model  (best epoch)",       best_test_rate),
+        ("ICL Model  (final epoch)",      test_rate),
+    ]
+    print("\n" + "=" * 68)
     print("  TRAINING COMPLETE")
-    print("=" * 75)
-    print(f"  {'1. MMSE BF + Perfect CSI:':<40s} {baselines['mmse_perfect']:.4f} bps/Hz")
-    print(f"  {'2. MMSE BF + Imperfect CSI:':<40s} {baselines['mmse_imperfect']:.4f} bps/Hz")
-    print(f"  {'3. Opt(p,lam) + Perfect CSI:':<40s} {baselines['opt_perfect']:.4f} bps/Hz")
-    print(f"  {'4. Opt(p,lam) + Imperfect CSI:':<40s} {baselines['opt_imperfect']:.4f} bps/Hz")
-    print(f"  {'>> ICL Model (best test):':<40s} {best_test_rate:.4f} bps/Hz")
-    print(f"  {'>> ICL Model (final):':<40s} {test_rate:.4f} bps/Hz")
+    print("=" * 68)
+    print(f"  {'Method':<38} {'bps/Hz':>8}  {'vs B4':>7}")
+    print("-" * 68)
+    for name, val in rows:
+        pct = f"{100*val/b4:.1f}%" if b4 > 0 else "-"
+        print(f"  {name:<38} {val:>8.4f}  {pct:>7}")
     print(f"\n  Dataset: {dataset.size} ({dataset.n_sup} sup + {dataset.n_unsup} unsup)")
-    print("=" * 75)
+    print("=" * 68)
+
+    # ---- Plot Training Curves ----
+    _plot_curves(history, baselines, cfg, save_path='training_curves_v2.png')
 
     return model, dataset, baselines
+
+
+###############################################################################
+# PLOTTING
+###############################################################################
+def _plot_curves(history: Dict, baselines: Dict, cfg: 'Config',
+                 save_path: str = 'training_curves.png') -> None:
+    ep = list(range(1, len(history['test_rate']) + 1))
+    p1 = cfg.phase1_epochs
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    fig.suptitle(f"ICL Precoding  K={cfg.K} N={cfg.N} L_p={cfg.L_p} "
+                 f"SNR={cfg.SNR_dB}dB  demos={cfg.n_demos}", fontsize=12)
+
+    # ── (0,0) Test rate per epoch ──────────────────────────────────────────
+    ax = axes[0, 0]
+    ax.plot(ep, history['test_rate'], 'b-o', ms=2, lw=1.4, label='ICL Model (test)')
+    colors = ['#333333', '#2ca02c', '#d62728', '#ff7f0e']
+    labels = ['MMSE BF Perfect', 'MMSE BF Imperfect', 'Opt(p,lam) Perfect', 'Opt(p,lam) Imperfect']
+    keys   = ['mmse_perfect', 'mmse_imperfect', 'opt_perfect', 'opt_imperfect']
+    for c, lbl, k in zip(colors, labels, keys):
+        ax.axhline(baselines[k], color=c, linestyle='--', lw=1.2, label=lbl)
+    ax.axvline(p1 + 0.5, color='gray', linestyle=':', lw=1.0, label='Ph1→Ph2')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Sum Rate (bps/Hz)')
+    ax.set_title('Test Sum Rate vs Epoch')
+    ax.legend(fontsize=7, ncol=2); ax.grid(True, alpha=0.3)
+
+    # ── (0,1) Unsupervised training rate (Phase 2 only) ───────────────────
+    ax = axes[0, 1]
+    p2_ep    = [e for e, ph in zip(ep, history['phase']) if ph == 2]
+    p2_rates = [r for r, ph in zip(history['train_rate'], history['phase']) if ph == 2]
+    ax.plot(p2_ep, p2_rates, 'r-o', ms=2, lw=1.4, label='Train rate (unsup)')
+    ax.axhline(baselines['opt_imperfect'], color='#ff7f0e', linestyle='--', lw=1.2,
+               label='Opt(p,lam) Imperfect')
+    ax.axhline(baselines['mmse_imperfect'], color='#2ca02c', linestyle='--', lw=1.2,
+               label='MMSE BF Imperfect')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Sum Rate (bps/Hz)')
+    ax.set_title('Unsupervised Training Rate (Phase 2)')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    # ── (1,0) Supervised MSE (Phase 1 only, log scale) ────────────────────
+    ax = axes[1, 0]
+    p1_ep  = [e for e, ph in zip(ep, history['phase']) if ph == 1]
+    p1_mse = [m for m, ph in zip(history['mse'], history['phase']) if ph == 1]
+    ax.semilogy(p1_ep, p1_mse, 'g-o', ms=2, lw=1.4, label='Supervised MSE')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('MSE (log)')
+    ax.set_title('Supervised MSE Loss (Phase 1)')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+    # ── (1,1) Dataset growth ───────────────────────────────────────────────
+    ax = axes[1, 1]
+    ax.plot(ep, history['ds_size'], 'purple', lw=1.4, label='Dataset size')
+    ax.axvline(p1 + 0.5, color='gray', linestyle=':', lw=1.0, label='Ph1→Ph2')
+    ax2 = ax.twinx()
+    ax2.bar(ep, history['ep_added'], color='mediumpurple', alpha=0.4, label='Added/epoch')
+    ax2.set_ylabel('Samples added per epoch', color='mediumpurple')
+    ax.set_xlabel('Epoch'); ax.set_ylabel('Total dataset size')
+    ax.set_title('Dataset Growth (Self-Bootstrapping)')
+    ax.legend(loc='upper left', fontsize=8); ax2.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  Training curves saved → {save_path}")
 
 
 ###############################################################################
@@ -672,20 +800,22 @@ def train(cfg: Config):
 ###############################################################################
 if __name__ == "__main__":
     cfg = Config(
-        K=16, N=16, L_p=32,
-        P_max=1.0, SNR_dB=15,
-        n_demos=20,              # 4 → 20: longer in-context sequence
-        encoder_hidden=256,      # 128 → 256
-        d_model=256, n_heads=8, n_layers=4, d_ff=512,  # larger backbone
+        K=16, N=16, L_p=10,      # L_p < K: realistic under-determined pilot regime
+        P_max=1.0, SNR_dB=20,    # 20 dB keeps imperfect-CSI gap reasonable with L_p=10
+        n_demos=32,              # longer ICL context (was 20)
+        encoder_hidden=256,
+        d_model=512, n_heads=8, n_layers=6, d_ff=1024,  # larger backbone (was 256/4/512)
         dropout=0.0,
         batch_size=64,
-        lr=3e-4, weight_decay=1e-4,
-        initial_dataset_size=3000,
+        lr=2e-4, lr_min=5e-5,   # cosine annealing 2e-4 -> 5e-5 (was fixed 3e-4)
+        weight_decay=1e-4,
+        initial_dataset_size=1024,
         opt_iters=500, opt_lr=0.03,
-        phase1_epochs=80,        # 30 → 80
-        phase2_epochs=120,       # 70 → 120 (total 200)
+        phase1_epochs=16,
+        phase2_epochs=100,
         steps_per_epoch=80,
         r_max=0.85,
+        unsup_scale=0.005,
         tau_start=30, tau_end=65,
         max_dataset_size=30000,
         n_test=300,
