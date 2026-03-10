@@ -800,7 +800,7 @@ def _plot_curves(history: Dict, baselines: Dict, cfg: 'Config',
 ###############################################################################
 if __name__ == "__main__":
     cfg = Config(
-        K=16, N=16, L_p=10,      # L_p < K: realistic under-determined pilot regime
+        K=32, N=32, L_p=20,      # L_p < K: realistic under-determined pilot regime
         P_max=1.0, SNR_dB=20,    # 20 dB keeps imperfect-CSI gap reasonable with L_p=10
         n_demos=32,              # longer ICL context (was 20)
         encoder_hidden=256,
