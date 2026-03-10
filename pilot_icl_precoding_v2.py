@@ -40,7 +40,7 @@ class Config:
         # System
         self.K = kwargs.get('K', 16)
         self.N = kwargs.get('N', 16)
-        self.L_p = kwargs.get('L_p', 10)
+        self.L_p = kwargs.get('L_p', 32)
         self.P_max = kwargs.get('P_max', 1.0)
         self.SNR_dB = kwargs.get('SNR_dB', 15)
         self.sigma2 = self.P_max / (10 ** (self.SNR_dB / 10))
@@ -157,7 +157,7 @@ def reconstruct_precoder(H: torch.Tensor, p: torch.Tensor, lam: torch.Tensor,
     H:(B,K,N), p:(B,K), lam:(B,K) -> W:(B,N,K)
     """
     B, K, N = H.shape
-    h = H.transpose(-1, -2)  # (B, N, K): columns are h_1,...,h_K
+    h = H.conj().transpose(-1, -2)  # (B, N, K): conjugate transpose, columns are h_1*,...,h_K*
     lam_diag = torch.diag_embed(lam / sigma2).to(torch.cfloat)  # (B, K, K)
     eye = torch.eye(N, device=device, dtype=torch.cfloat).unsqueeze(0).expand(B, -1, -1)
     A = eye + h @ lam_diag @ h.conj().transpose(-1, -2)  # (B, N, N)
@@ -193,13 +193,13 @@ def generate_optimal_params(H: torch.Tensor, P_max: float, sigma2: float,
     best_lam = torch.zeros(B, K, device=device)
 
     for restart in range(n_restarts):
-        p_log = torch.randn(B, K, device=device, requires_grad=True) * 0.1
-        lam_log = torch.randn(B, K, device=device, requires_grad=True) * 0.1
+        p_log = (torch.randn(B, K, device=device) * 0.1).detach().requires_grad_(True)
+        lam_log = (torch.randn(B, K, device=device) * 0.1).detach().requires_grad_(True)
         opt = optim.Adam([p_log, lam_log], lr=lr)
 
         for i in range(n_iters):
             p = F.softmax(p_log, dim=-1) * P_max
-            lam = F.softmax(lam_log, dim=-1) * P_max
+            lam = F.softplus(lam_log)          # λ only needs to be positive, no sum constraint
             W = reconstruct_precoder(H_d, p, lam, sigma2)
             rate = compute_sum_rate(H_d, W, sigma2)
             loss = -rate.sum()
@@ -210,7 +210,7 @@ def generate_optimal_params(H: torch.Tensor, P_max: float, sigma2: float,
         # Snapshot best
         with torch.no_grad():
             p_snap = F.softmax(p_log, dim=-1) * P_max
-            lam_snap = F.softmax(lam_log, dim=-1) * P_max
+            lam_snap = F.softplus(lam_log)
             W_snap = reconstruct_precoder(H_d, p_snap, lam_snap, sigma2)
             rate_snap = compute_sum_rate(H_d, W_snap, sigma2)
             improved = rate_snap > best_rate
@@ -372,10 +372,11 @@ class PilotICLModel(nn.Module):
         return tok
 
     def _extract(self, raw):
-        x = torch.sigmoid(raw[:, :self.label_dim])
-        p = x[:, :self.K]; lam = x[:, self.K:]
+        # p: softmax → total power = P_max
+        p = torch.sigmoid(raw[:, :self.K])
         p = p / (p.sum(-1, keepdim=True) + 1e-8) * self.P_max
-        lam = lam / (lam.sum(-1, keepdim=True) + 1e-8) * self.P_max
+        # lam: softplus → positive only, no sum constraint (matches WMMSE dual variables)
+        lam = F.softplus(raw[:, self.K:2 * self.K])
         return p, lam
 
     def forward(self, demo_pilots, demo_p, demo_lam, query_pilot):
@@ -481,7 +482,7 @@ def train(cfg: Config):
     print("  PILOT-BASED ICL PRECODING WITH CURRICULUM SELF-EVOLUTION")
     print("=" * 75)
     print(f"  Device: {device}")
-    print(f"  System: K={cfg.K}, N={cfg.N}, L_p={cfg.L_p}, SNR={cfg.SNR_dB}dB, σ²={cfg.sigma2:.6f}")
+    print(f"  System: K={cfg.K}, N={cfg.N}, L_p={cfg.L_p}, SNR={cfg.SNR_dB}dB, sigma2={cfg.sigma2:.6f}")
     print(f"  Tokens: dim={cfg.token_dim}, demos={cfg.n_demos}, seq_len={2*cfg.n_demos+1}")
     print(f"  Model:  d={cfg.d_model}, heads={cfg.n_heads}, layers={cfg.n_layers}, ff={cfg.d_ff}")
     print(f"  Train:  Phase1={cfg.phase1_epochs}ep, Phase2={cfg.phase2_epochs}ep, "
@@ -502,21 +503,31 @@ def train(cfg: Config):
     print("  BASELINES on fixed test set:")
     print(f"    1. MMSE BF + Perfect CSI:      {baselines['mmse_perfect']:.4f} bps/Hz")
     print(f"    2. MMSE BF + Imperfect CSI:    {baselines['mmse_imperfect']:.4f} bps/Hz")
-    print(f"    3. Opt(p,λ) + Perfect CSI:     {baselines['opt_perfect']:.4f} bps/Hz")
-    print(f"    4. Opt(p,λ) + Imperfect CSI:   {baselines['opt_imperfect']:.4f} bps/Hz")
+    print(f"    3. Opt(p,lam) + Perfect CSI:   {baselines['opt_perfect']:.4f} bps/Hz")
+    print(f"    4. Opt(p,lam) + Imperfect CSI: {baselines['opt_imperfect']:.4f} bps/Hz")
     print("-" * 75)
 
-    # ---- Generate initial labeled dataset ----
-    print(f"\nGenerating initial dataset (M0={cfg.initial_dataset_size})...")
+    # ---- Generate initial labeled dataset (imperfect-CSI labels) ----
+    # We optimize WMMSE on Hhat (not perfect H), and store the imperfect-CSI achievable rate.
+    # This puts dataset rates in the same space as model predictions during self-bootstrapping.
+    print(f"\nGenerating initial dataset (M0={cfg.initial_dataset_size}, using imperfect CSI labels)...")
     dataset = DynDataset(max_sz=cfg.max_dataset_size)
-    gen_bs = min(128, cfg.initial_dataset_size)
+    gen_bs = min(64, cfg.initial_dataset_size)
     for s in range(0, cfg.initial_dataset_size, gen_bs):
         e = min(s + gen_bs, cfg.initial_dataset_size)
         H_b = generate_channel(e - s, cfg.K, cfg.N)
-        p_b, lam_b, r_b = generate_optimal_params(H_b, cfg.P_max, cfg.sigma2,
-                                                    n_iters=cfg.opt_iters, lr=cfg.opt_lr)
+        # Estimate channel from pilots (same condition as model input)
+        Y_b = pilot_observe(H_b, Phi, cfg.sigma2)
+        H_hat_b = mmse_channel_est(Y_b, Phi, cfg.sigma2)
+        # Optimize (p, lam) on H_hat (imperfect CSI)
+        p_b, lam_b, _ = generate_optimal_params(H_hat_b, cfg.P_max, cfg.sigma2,
+                                                  n_iters=cfg.opt_iters, lr=cfg.opt_lr)
+        # Evaluate achievable rate on TRUE H (imperfect-CSI rate as reference)
+        with torch.no_grad():
+            W_b = reconstruct_precoder(H_hat_b, p_b, lam_b, cfg.sigma2)
+            r_b = compute_sum_rate(H_b, W_b, cfg.sigma2)
         dataset.add(H_b, p_b, lam_b, r_b, supervised=True)
-        print(f"  [{e}/{cfg.initial_dataset_size}] avg rate: {r_b.mean():.4f}")
+        print(f"  [{e}/{cfg.initial_dataset_size}] avg rate: {r_b.mean():.4f}", flush=True)
     print(f"  Dataset ready: {dataset.size} samples, avg rate: {dataset.rates.mean():.4f}")
 
     # ---- Model ----
@@ -638,7 +649,7 @@ def train(cfg: Config):
               f"{dataset.size:5d} {ep_added:4d} | "
               f"{baselines['mmse_perfect']:6.2f} {baselines['mmse_imperfect']:6.2f} "
               f"{baselines['opt_perfect']:6.2f} {baselines['opt_imperfect']:6.2f}  "
-              f"({dt:.1f}s)")
+              f"({dt:.1f}s)", flush=True)
 
     # ---- Final Summary ----
     print("\n" + "=" * 75)
@@ -646,8 +657,8 @@ def train(cfg: Config):
     print("=" * 75)
     print(f"  {'1. MMSE BF + Perfect CSI:':<40s} {baselines['mmse_perfect']:.4f} bps/Hz")
     print(f"  {'2. MMSE BF + Imperfect CSI:':<40s} {baselines['mmse_imperfect']:.4f} bps/Hz")
-    print(f"  {'3. Opt(p,λ) + Perfect CSI:':<40s} {baselines['opt_perfect']:.4f} bps/Hz")
-    print(f"  {'4. Opt(p,λ) + Imperfect CSI:':<40s} {baselines['opt_imperfect']:.4f} bps/Hz")
+    print(f"  {'3. Opt(p,lam) + Perfect CSI:':<40s} {baselines['opt_perfect']:.4f} bps/Hz")
+    print(f"  {'4. Opt(p,lam) + Imperfect CSI:':<40s} {baselines['opt_imperfect']:.4f} bps/Hz")
     print(f"  {'>> ICL Model (best test):':<40s} {best_test_rate:.4f} bps/Hz")
     print(f"  {'>> ICL Model (final):':<40s} {test_rate:.4f} bps/Hz")
     print(f"\n  Dataset: {dataset.size} ({dataset.n_sup} sup + {dataset.n_unsup} unsup)")
@@ -661,18 +672,18 @@ def train(cfg: Config):
 ###############################################################################
 if __name__ == "__main__":
     cfg = Config(
-        K=16, N=16, L_p=10,
+        K=16, N=16, L_p=32,
         P_max=1.0, SNR_dB=15,
-        n_demos=4,
-        encoder_hidden=128,
-        d_model=128, n_heads=4, n_layers=3, d_ff=256,
+        n_demos=20,              # 4 → 20: longer in-context sequence
+        encoder_hidden=256,      # 128 → 256
+        d_model=256, n_heads=8, n_layers=4, d_ff=512,  # larger backbone
         dropout=0.0,
         batch_size=64,
         lr=3e-4, weight_decay=1e-4,
         initial_dataset_size=3000,
         opt_iters=500, opt_lr=0.03,
-        phase1_epochs=30,
-        phase2_epochs=70,
+        phase1_epochs=80,        # 30 → 80
+        phase2_epochs=120,       # 70 → 120 (total 200)
         steps_per_epoch=80,
         r_max=0.85,
         tau_start=30, tau_end=65,
