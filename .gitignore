@@ -14,3 +14,5 @@ single_model_result/
 .vscode/
 .__pycache__/
 pilot_icl_4_1.py
+.__pycache__/
+*.pyc
