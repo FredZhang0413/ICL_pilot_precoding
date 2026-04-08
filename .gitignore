@@ -20,3 +20,6 @@ pilot_icl_random_context_4_2.py
 pilot_noicl_sparse.py
 run_baselines_fast.py
 pilot_icl_precoding_v2.py
+a1a_training_curve.png
+train_test_rate_curve.png
+training_curves_v2.png
