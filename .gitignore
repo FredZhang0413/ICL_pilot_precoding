@@ -19,3 +19,4 @@ pilot_icl_4_1.py
 pilot_icl_random_context_4_2.py
 pilot_noicl_sparse.py
 run_baselines_fast.py
+pilot_icl_precoding_v2.py
