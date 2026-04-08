@@ -1,0 +1,13 @@
+pilot-icl-4-1.py ->pilot-icl-4-2.py : mainly change the CL scheduling method: works!
+
+pilot-icl-4-2.py ->pilot_icl_random_context_4_2.py : return to the random context selection: works!
+
+pilot_icl_random_context_4_2.py ->pilot icl 4 3.py: change the originals of the unsupervised part of the loss function
+
+pilot icl 4 3.py -> pilot icl 4 3 2.py: add a residual bf norm constraint to prevent lazy learning on mmse-imp solutions
+
+pilot icl 4 3 2.py -> pilot icl 4 3 3.py: specify the loss function to be MSE loss+rate loss (unsup samples in dataset)+rate loss(fresh unsup samples), decide that all samples in dataset can be query token in MSE loss function; train rate display becomes the average rate of the second term in total loss.
+
+pilot icl 4 3 3.py -> pilot icl 4 4.py: delete the current fully-connected bf-decoder-NN, and let ICL-Transformer directly output full-size beamformer solution. 
+
+pilot icl 4 4.py -> pilot icl 4 5.py: 
