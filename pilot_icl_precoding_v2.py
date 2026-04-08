@@ -305,12 +305,24 @@ class PilotEncoder(nn.Module):
         self.attn_q = nn.Parameter(torch.randn(1, 1, hidden) * 0.02)
         self.attn_k = nn.Linear(hidden, hidden)
         self.attn_v = nn.Linear(hidden, hidden)
+<<<<<<< HEAD
         # Output: pilot-only latent -> 4*K token
         self.out_proj = nn.Sequential(
             nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 4 * K))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, 2*N*L_p) -> (B, 4K)"""
+=======
+        # Branch 2: MMSE channel estimate H_hat (MLP over vec(H_hat))
+        self.h_branch = nn.Sequential(
+            nn.Linear(2 * K * N, hidden), nn.GELU(), nn.Linear(hidden, hidden))
+        # Combined output: cat([z_y, z_h]) -> 4*K token
+        self.out_proj = nn.Sequential(
+            nn.Linear(2 * hidden, hidden), nn.GELU(), nn.Linear(hidden, 4 * K))
+
+    def forward(self, x: torch.Tensor, h_hat: torch.Tensor) -> torch.Tensor:
+        """x: (B, 2*N*L_p), h_hat: (B, 2*K*N) -> (B, 4K)"""
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
         B = x.size(0)
         # Branch 1: CNN over pilot slots
         x = x.view(B, 2 * self.N, self.L_p)
@@ -321,7 +333,13 @@ class PilotEncoder(nn.Module):
         k, v = self.attn_k(x), self.attn_v(x)
         w = F.softmax(torch.bmm(q, k.transpose(1, 2)) / math.sqrt(k.size(-1)), dim=-1)
         z_y = torch.bmm(w, v).squeeze(1)            # (B, hidden)
+<<<<<<< HEAD
         return self.out_proj(z_y)
+=======
+        # Branch 2: MMSE estimate hint
+        z_h = self.h_branch(h_hat)                  # (B, hidden)
+        return self.out_proj(torch.cat([z_y, z_h], dim=-1))
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
 
 
 ###############################################################################
@@ -397,16 +415,31 @@ class PilotICLModel(nn.Module):
         lam = F.softplus(raw[:, self.K:2 * self.K])
         return p, lam
 
+<<<<<<< HEAD
     def forward(self, demo_pilots, demo_p, demo_lam, query_pilot):
         """
         demo_pilots:  (B, l, 2*N*L_p)   raw pilot obs (real)
         demo_p/lam:   (B, l, K)
         query_pilot:  (B, 2*N*L_p)
+=======
+    def forward(self, demo_pilots, demo_h_hats, demo_p, demo_lam, query_pilot, query_h_hat):
+        """
+        demo_pilots:  (B, l, 2*N*L_p)   raw pilot obs (real)
+        demo_h_hats:  (B, l, 2*K*N)     MMSE estimate of demo channels (real)
+        demo_p/lam:   (B, l, K)
+        query_pilot:  (B, 2*N*L_p)
+        query_h_hat:  (B, 2*K*N)
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
         Returns: (p_pred, lam_pred) each (B, K)
         """
         B, l, pd = demo_pilots.shape
         all_pil  = torch.cat([demo_pilots.reshape(B*l, pd), query_pilot], dim=0)
+<<<<<<< HEAD
         all_z = self.encoder(all_pil)
+=======
+        all_hhat = torch.cat([demo_h_hats.reshape(B*l, -1), query_h_hat], dim=0)
+        all_z = self.encoder(all_pil, all_hhat)
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
         demo_z = all_z[:B*l].reshape(B, l, self.token_dim)
         query_z = all_z[B*l:]
 
@@ -476,15 +509,27 @@ def evaluate_model(model: PilotICLModel, dataset: DynDataset,
         Y = pilot_observe(H, Phi, cfg.sigma2)
         pil = pilot_to_real(Y)
         H_hat = mmse_channel_est(Y, Phi, cfg.sigma2)
+<<<<<<< HEAD
+=======
+        q_h_hat = hhat_to_real(H_hat)
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
 
         # Context from dataset (random)
         idx = torch.randint(0, dataset.size, (b, cfg.n_demos), device=device)
         d_H = dataset.H[idx].reshape(b * cfg.n_demos, cfg.K, cfg.N)
         d_Y = pilot_observe(d_H, Phi, cfg.sigma2)
         d_pil = pilot_to_real(d_Y).reshape(b, cfg.n_demos, -1)
+<<<<<<< HEAD
         d_p, d_lam = dataset.p[idx], dataset.lam[idx]
 
         p_pred, lam_pred = model(d_pil, d_p, d_lam, pil)
+=======
+        d_H_hat = mmse_channel_est(d_Y, Phi, cfg.sigma2)
+        d_h_hat = hhat_to_real(d_H_hat).reshape(b, cfg.n_demos, -1)
+        d_p, d_lam = dataset.p[idx], dataset.lam[idx]
+
+        p_pred, lam_pred = model(d_pil, d_h_hat, d_p, d_lam, pil, q_h_hat)
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
         W = reconstruct_precoder(H_hat, p_pred, lam_pred, cfg.sigma2)
         all_rates.append(compute_sum_rate(H, W, cfg.sigma2))
 
@@ -500,7 +545,11 @@ def train(cfg: Config):
     print("  PILOT-BASED ICL PRECODING WITH CURRICULUM SELF-EVOLUTION")
     print("=" * 75)
     print(f"  Device: {device}")
+<<<<<<< HEAD
     print(f"  System: K={cfg.K}, N={cfg.N} , L_p={cfg.L_p}, SNR={cfg.SNR_dB}dB, sigma2={cfg.sigma2:.6f}")
+=======
+    print(f"  System: K={cfg.K}, N={cfg.N}, L_p={cfg.L_p}, SNR={cfg.SNR_dB}dB, sigma2={cfg.sigma2:.6f}")
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
     print(f"  Tokens: dim={cfg.token_dim}, demos={cfg.n_demos}, seq_len={2*cfg.n_demos+1}")
     print(f"  Model:  d={cfg.d_model}, heads={cfg.n_heads}, layers={cfg.n_layers}, ff={cfg.d_ff}")
     print(f"  Train:  Phase1={cfg.phase1_epochs}ep, Phase2={cfg.phase2_epochs}ep, "
@@ -526,19 +575,38 @@ def train(cfg: Config):
     print(f"    4. Opt(p,lam) + Imperfect CSI: {baselines['opt_imperfect']:.4f} bps/Hz")
     print("-" * 75)
 
+<<<<<<< HEAD
     # ---- Generate initial labeled dataset (true-CSI labels for demonstrations) ----
     print(f"\nGenerating initial dataset (M0={cfg.initial_dataset_size}, using true-CSI labels)...")
+=======
+    # ---- Generate initial labeled dataset (imperfect-CSI labels) ----
+    # We optimize WMMSE on Hhat (not perfect H), and store the imperfect-CSI achievable rate.
+    # This puts dataset rates in the same space as model predictions during self-bootstrapping.
+    print(f"\nGenerating initial dataset (M0={cfg.initial_dataset_size}, using imperfect CSI labels)...")
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
     dataset = DynDataset(max_sz=cfg.max_dataset_size)
     gen_bs = min(64, cfg.initial_dataset_size)
     for s in range(0, cfg.initial_dataset_size, gen_bs):
         e = min(s + gen_bs, cfg.initial_dataset_size)
         H_b = generate_channel(e - s, cfg.K, cfg.N)
+<<<<<<< HEAD
         # Optimize (p, lam) on true H
         p_b, lam_b, _ = generate_optimal_params(H_b, cfg.P_max, cfg.sigma2,
                                                   n_iters=cfg.opt_iters, lr=cfg.opt_lr)
         # Evaluate achievable rate on TRUE H
         with torch.no_grad():
             W_b = reconstruct_precoder(H_b, p_b, lam_b, cfg.sigma2)
+=======
+        # Estimate channel from pilots (same condition as model input)
+        Y_b = pilot_observe(H_b, Phi, cfg.sigma2)
+        H_hat_b = mmse_channel_est(Y_b, Phi, cfg.sigma2)
+        # Optimize (p, lam) on H_hat (imperfect CSI)
+        p_b, lam_b, _ = generate_optimal_params(H_hat_b, cfg.P_max, cfg.sigma2,
+                                                  n_iters=cfg.opt_iters, lr=cfg.opt_lr)
+        # Evaluate achievable rate on TRUE H (imperfect-CSI rate as reference)
+        with torch.no_grad():
+            W_b = reconstruct_precoder(H_hat_b, p_b, lam_b, cfg.sigma2)
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
             r_b = compute_sum_rate(H_b, W_b, cfg.sigma2)
         dataset.add(H_b, p_b, lam_b, r_b, supervised=True)
         print(f"  [{e}/{cfg.initial_dataset_size}] avg rate: {r_b.mean():.4f}", flush=True)
@@ -610,12 +678,24 @@ def train(cfg: Config):
             d_H_flat = d_H.reshape(B * l, cfg.K, cfg.N)
             d_Y = pilot_observe(d_H_flat, Phi, cfg.sigma2)
             d_pil = pilot_to_real(d_Y).reshape(B, l, -1)
+<<<<<<< HEAD
             q_Y = pilot_observe(q_H, Phi, cfg.sigma2)
             q_pil = pilot_to_real(q_Y)
             q_H_hat = mmse_channel_est(q_Y, Phi, cfg.sigma2)
 
             # Forward
             p_pred, lam_pred = model(d_pil, d_p, d_lam, q_pil)
+=======
+            d_H_hat = mmse_channel_est(d_Y, Phi, cfg.sigma2)
+            d_h_hat = hhat_to_real(d_H_hat).reshape(B, l, -1)
+            q_Y = pilot_observe(q_H, Phi, cfg.sigma2)
+            q_pil = pilot_to_real(q_Y)
+            q_H_hat = mmse_channel_est(q_Y, Phi, cfg.sigma2)
+            q_h_hat = hhat_to_real(q_H_hat)
+
+            # Forward
+            p_pred, lam_pred = model(d_pil, d_h_hat, d_p, d_lam, q_pil, q_h_hat)
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
 
             # Losses
             mse_per = (F.mse_loss(p_pred, q_p_gt, reduction='none').sum(-1) +
@@ -793,12 +873,20 @@ if __name__ == "__main__":
         initial_dataset_size=1024,
         opt_iters=500, opt_lr=0.03,
         phase1_epochs=16,
+<<<<<<< HEAD
         phase2_epochs=500,
+=======
+        phase2_epochs=100,
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
         steps_per_epoch=80,
         r_max=0.85,
         unsup_scale=0.005,
         tau_start=30, tau_end=65,
+<<<<<<< HEAD
         max_dataset_size=50000,
+=======
+        max_dataset_size=30000,
+>>>>>>> ed08f7d9f45970a1f2d7f71307602d7ffb950af8
         n_test=300,
     )
     train(cfg)
