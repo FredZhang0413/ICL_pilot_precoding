@@ -417,13 +417,11 @@ def train(cfg):
             C0 = th.zeros(B, cfg.K, cfg.N, device=device, dtype=th.cfloat)
             C0[:, :cfg.L_p, :] = Y_t  # first L_p "users" filled with pilot data
 
-            # === Random initial beamformer W^(0) ===
-            W0_r = th.randn(B, cfg.K, cfg.N, device=device)
-            W0_i = th.randn(B, cfg.K, cfg.N, device=device)
-            W0 = th.complex(W0_r, W0_i)
-            # Power normalize (K×N → transpose to N×K for normalization, then back)
-            W0_nk = power_normalize(W0.transpose(-1,-2), cfg.P_max).transpose(-1,-2)  # (B,K,N)
-            W0 = W0_nk
+            # === Initial beamformer W^(0): MMSE BF from imperfect CSI ===
+            # Imperfect CSI is obtained via LS channel estimate using MP-inverse on pilots.
+            H_ls = ls_channel_est(Y, Phi)                             # (B, K, N)
+            W0_nk = mmse_beamformer(H_ls, cfg.P_max, cfg.sigma2)      # (B, N, K)
+            W0 = W0_nk.transpose(-1, -2).contiguous()                 # (B, K, N)
 
             # === Build dual-tokenization inputs ===
             # User-level: (B, 4K, N)
@@ -466,10 +464,8 @@ def train(cfg):
                 Yt = Yb.transpose(-1,-2)
                 C0 = th.zeros(b, cfg.K, cfg.N, device=device, dtype=th.cfloat)
                 C0[:, :cfg.L_p, :] = Yt
-                W0 = power_normalize(
-                    th.complex(th.randn(b,cfg.N,cfg.K,device=device),
-                               th.randn(b,cfg.N,cfg.K,device=device)),
-                    cfg.P_max).transpose(-1,-2)
+                H_ls_b = ls_channel_est(Yb, Phi)                       # (b, K, N)
+                W0 = mmse_beamformer(H_ls_b, cfg.P_max, cfg.sigma2).transpose(-1, -2).contiguous()
 
                 Cu = th.cat([C0.real, C0.imag], dim=1)
                 Wu = th.cat([W0.real, W0.imag], dim=1)
@@ -487,6 +483,14 @@ def train(cfg):
         ar = ep_rate / max(1, ep_n); dt = time.time() - t0
         hist['test'].append(tr); hist['train'].append(ar)
 
+        # Save training-rate snapshot every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            ep_tensor = th.arange(1, len(hist['train']) + 1)
+            th.save({
+                'epochs': ep_tensor,
+                'train_rate': th.tensor(hist['train'], dtype=th.float32),
+            }, 'train_rate_sallom.pt')
+
         print(f"{epoch+1:3d} ph{phase} [{window_start}-{window_end}] | "
               f"train={ar:.2f} test={tr:.3f} best={best_test:.3f} | "
               f"B1={bl_mmse_p:.2f} B2={bl_mmse_e:.2f} ({dt:.1f}s)", flush=True)
@@ -497,6 +501,14 @@ def train(cfg):
     for k,v in [("MMSE+Perfect", bl_mmse_p), ("MMSE+Imperfect", bl_mmse_e),
                 ("SALLO-M best", best_test), ("SALLO-M final", tr)]:
         print(f"  {k:<25} {v:8.3f}")
+
+    # Final overwrite save
+    ep_tensor = th.arange(1, len(hist['train']) + 1)
+    th.save({
+        'epochs': ep_tensor,
+        'train_rate': th.tensor(hist['train'], dtype=th.float32),
+    }, 'train_rate_sallom.pt')
+
     return model, hist
 
 
